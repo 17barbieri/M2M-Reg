@@ -1,0 +1,6 @@
+*.pyc
+*.egg-info
+results/
+*.log
+wandb/
+results_test/
