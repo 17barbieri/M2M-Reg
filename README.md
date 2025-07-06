@@ -79,6 +79,8 @@ Subject metadata must be provided via a [Google Spreadsheet](https://docs.google
 - `set`  
 - `exclude`  
 
+You must provide the spreadsheet URL as the `sheet_url` argument when generating the HDF5 file.
+
 #### Expected folder structure after preprocessing (PET-MRI example)
 
 ```
