@@ -4,13 +4,15 @@ import logging
 import numpy as np
 import torch
 import h5py
+import pandas as pd
+from standard_utils import *
 
 class ADNI_Dataset(torch.utils.data.Dataset):
     def __init__(self, args, device="cpu", which_set="train", return_labels=False):
         self.device = device
         self.return_labels = return_labels
         self.which_set = which_set
-        
+
         hdf5_path = os.path.join(args.data_path, f"{args.dataset}_{which_set}.hdf5")
         self.data_dict = {}
         with h5py.File(hdf5_path, "r") as hf:
@@ -27,7 +29,7 @@ class ADNI_Dataset(torch.utils.data.Dataset):
             self.num_cano = int((float(args.num_cano[:-1]) / 100) * self.subject_num)
         else:
             self.num_cano = int(args.num_cano)
-        
+
         if self.num_cano == -1:
             self.cano_idx = list(range(self.subject_num))
         else:
@@ -39,7 +41,7 @@ class ADNI_Dataset(torch.utils.data.Dataset):
 
     def minmax_norm(self, img):
         return (img - img.min()) / (img.max() - img.min())
-    
+
     def random_sagittal_flip(self, img, seg, separately=False):
         """Sagittal 방향으로 랜덤 플립 수행"""
         if 'train' in self.which_set:
@@ -53,7 +55,7 @@ class ADNI_Dataset(torch.utils.data.Dataset):
                     img = torch.flip(img, dims=[1])  # img.shape = (1, 128, 128, 128)
                     seg = torch.flip(seg, dims=[1])
         return img, seg
-    
+
     def __getitem__(self, idx):
         if self.num_cano != 0:
             if self.num_cano == -1:
@@ -63,7 +65,7 @@ class ADNI_Dataset(torch.utils.data.Dataset):
                     cano_tgt_idx = random.choice(range(self.subject_num))
             else:
                 cano_idx = random.choice(self.cano_idx)
-        
+
         src_idx = random.randint(0, self.subject_num-1)
         tgt_idx = random.randint(0, self.subject_num-1)
         if self.num_cano == -1:
@@ -74,7 +76,7 @@ class ADNI_Dataset(torch.utils.data.Dataset):
             while self.num_cano != 0 and (src_idx == cano_idx or tgt_idx == cano_idx):
                 src_idx = random.randint(0, self.subject_num-1)
                 tgt_idx = random.randint(0, self.subject_num-1)
-        
+
         src_modal, tgt_modal = random.choice([('PT', 'ST'), ('ST', 'PT')])
         src_img = self.data_dict[src_modal][src_idx].unsqueeze(0)
         tgt_img = self.data_dict[tgt_modal][tgt_idx].unsqueeze(0)
@@ -84,7 +86,7 @@ class ADNI_Dataset(torch.utils.data.Dataset):
         # Min-Max Normalization
         src_img = self.minmax_norm(src_img)
         tgt_img = self.minmax_norm(tgt_img)
-        
+
         # Apply Augmentation if in training set
         if 'train' in self.which_set:
             src_img, src_seg = self.random_sagittal_flip(src_img, src_seg)
@@ -94,24 +96,121 @@ class ADNI_Dataset(torch.utils.data.Dataset):
             if self.num_cano == -1:
                 src_cano_img = self.data_dict[src_modal][cano_src_idx].unsqueeze(0)
                 tgt_cano_img = self.data_dict[tgt_modal][cano_tgt_idx].unsqueeze(0)
-                
+
                 # Min-Max Normalization
                 src_cano_img = self.minmax_norm(src_cano_img)
                 tgt_cano_img = self.minmax_norm(tgt_cano_img)
-                
+
                 if 'train' in self.which_set:
                     src_cano_img, tgt_cano_img = self.random_sagittal_flip(src_cano_img, tgt_cano_img, separately=True)
             else:
                 src_cano_img = self.data_dict[src_modal][cano_idx].unsqueeze(0)
                 tgt_cano_img = self.data_dict[tgt_modal][cano_idx].unsqueeze(0)
-                
+
                 # Min-Max Normalization
                 src_cano_img = self.minmax_norm(src_cano_img)
                 tgt_cano_img = self.minmax_norm(tgt_cano_img)
-                
+
                 if 'train' in self.which_set:
                     src_cano_img, tgt_cano_img = self.random_sagittal_flip(src_cano_img, tgt_cano_img)
-            
+
             return src_img, tgt_img, src_seg, tgt_seg, src_cano_img, tgt_cano_img
-        
+
         return src_img, tgt_img, src_seg, tgt_seg, src_img, tgt_img
+
+class pelvic_T2_b0_Dataset(torch.utils.data.Dataset):
+    def __init__(self, args, device="cpu", which_set="train", training_type = 'basic'):
+        self.device = device
+        self.which_set = which_set
+        self.training_type = training_type
+
+        hdf5_path = os.path.join(args.data_path, f"{args.dataset}_{which_set}.hdf5")
+        self.data_dict = {}
+
+        with h5py.File(hdf5_path, "r") as hf:
+            self.data_dict['T2'] = torch.tensor(np.array(hf.get('T2_dataset')), dtype=torch.float32)
+            self.data_dict['b0'] = torch.tensor(np.array(hf.get('b0_dataset')), dtype=torch.float32)
+            self.data_dict['T2_seg'] = torch.tensor(np.array(hf.get('T2_seg_dataset')), dtype=torch.long)
+            self.data_dict['b0_seg'] = torch.tensor(np.array(hf.get('b0_seg_dataset')), dtype=torch.long)
+            self.data_dict['PatientID'] = np.array(hf.get('PatientID'))
+
+        self.data_num = args.data_num
+        self.subject_num = self.data_dict['T2'].shape[0]
+        logging.info(f"subject num: {self.subject_num}")
+
+        self.cano_idx = list(range(self.subject_num))
+        logging.info(f"Selected canonical subjects: \n{self.data_dict['PatientID'][self.cano_idx]}")
+
+    def __len__(self):
+        if self.training_type in ['basic', 'basic+']:
+            return len(self.data_dict['T2'])
+        return self.data_num
+
+    def minmax_norm(self, img):
+        return (img - img.min()) / (img.max() - img.min())
+
+    def random_sagittal_flip(self, img, seg, separately=False):
+        """Sagittal"""
+        if 'train' in self.which_set:
+            if separately:
+                if random.random() > 0.5:
+                    img = torch.flip(img, dims=[1])
+                if random.random() > 0.5:
+                    seg = torch.flip(seg, dims=[1])
+            else:
+                if random.random() > 0.5:
+                    img = torch.flip(img, dims=[1])  # img.shape = (1, 128, 128, 128)
+                    seg = torch.flip(seg, dims=[1])
+        return img, seg
+
+    def __getitem__(self, idx):
+        if self.training_type in ['basic', 'basic+']:
+            src_img = self.data_dict['T2'][idx].unsqueeze(0)
+            tgt_img = self.data_dict['b0'][idx].unsqueeze(0)
+            src_patient_id = self.data_dict['PatientID'][idx]
+            tgt_patient_id = self.data_dict['PatientID'][idx]
+
+            src_img = self.minmax_norm(src_img)
+            tgt_img = self.minmax_norm(tgt_img)
+            return src_img, tgt_img
+
+        cano_src_idx = random.choice(range(self.subject_num))
+        cano_tgt_idx = random.choice(range(self.subject_num))
+        while cano_src_idx == cano_tgt_idx:
+            cano_tgt_idx = random.choice(range(self.subject_num))
+
+        src_idx = random.randint(0, self.subject_num-1)
+        tgt_idx = random.randint(0, self.subject_num-1)
+        while (src_idx == cano_src_idx or src_idx == cano_tgt_idx or tgt_idx == cano_src_idx or tgt_idx == cano_tgt_idx):
+            src_idx = random.randint(0, self.subject_num-1)
+            tgt_idx = random.randint(0, self.subject_num-1)
+
+        src_img = self.data_dict['T2'][src_idx].unsqueeze(0)
+        tgt_img = self.data_dict['b0'][tgt_idx].unsqueeze(0)
+        src_seg = self.data_dict['T2_seg'][src_idx].unsqueeze(0).float()
+        tgt_seg = self.data_dict['b0_seg'][tgt_idx].unsqueeze(0).float()
+        src_patient_id = self.data_dict['PatientID'][src_idx]
+        tgt_patient_id = self.data_dict['PatientID'][tgt_idx]
+
+        # Min-Max Normalization
+        src_img = self.minmax_norm(src_img)
+        tgt_img = self.minmax_norm(tgt_img)
+
+        # Apply Augmentation if in training set
+        if 'train' in self.which_set:
+            src_img, src_seg = self.random_sagittal_flip(src_img, src_seg)
+            tgt_img, tgt_seg = self.random_sagittal_flip(tgt_img, tgt_seg)
+
+        src_cano_img = self.data_dict['T2'][cano_src_idx].unsqueeze(0)
+        tgt_cano_img = self.data_dict['b0'][cano_tgt_idx].unsqueeze(0)
+        src_cano_patient_id = self.data_dict['PatientID'][cano_src_idx]
+        tgt_cano_patient_id = self.data_dict['PatientID'][cano_tgt_idx]
+
+        # Min-Max Normalization
+        src_cano_img = self.minmax_norm(src_cano_img)
+        tgt_cano_img = self.minmax_norm(tgt_cano_img)
+
+        if 'train' in self.which_set:
+            src_cano_img, tgt_cano_img = self.random_sagittal_flip(src_cano_img, tgt_cano_img, separately=True)
+
+        return src_img, tgt_img, src_seg, tgt_seg, src_cano_img, tgt_cano_img

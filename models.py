@@ -1,18 +1,19 @@
-import itk
 import logging
+import argparse
 import numpy as np
 import torch
+import itk
+import ml_collections
 import icon_registration as icon
 import icon_registration.network_wrappers as network_wrappers
 import icon_registration.networks as networks
 from icon_registration import config
-from icon_registration.losses import ICONLoss, ICONLoss_can, ICONLoss_can_mono, flips
+from icon_registration.losses import BASICLoss, ICONLoss, ICONLoss_can, ICONLoss_can_mono, ICONLoss_can_unsupervised, ICONLoss_can_mono_unsupervised, flips
 from icon_registration.mermaidlite import compute_warped_image_multiNC
 import icon_registration.itk_wrapper
-import ml_collections
 
 class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
-    def __init__(self, args, network, similarity, use_label=False):
+    def __init__(self, args, network, similarity, use_label=False, verbose = True):
 
         super().__init__()
 
@@ -22,8 +23,9 @@ class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
         self.similarity = similarity
         self.use_label = use_label
         self.input_shape = args.input_shape
-        self.num_cano = args.num_cano
+        self.training_type = args.training_type
         self.log_mono = args.log_mono
+        self.verbose = verbose
 
     def create_Iepsilon(self):
         noise = 2 * torch.randn(*self.identity_map.shape).to(config.device) / self.identity_map.shape[-1]
@@ -58,20 +60,20 @@ class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
         # Add cycle edge
         self.phi_BcA = self.regis_net(cano_B, image_A)
         self.phi_BAc = self.regis_net(image_B, cano_A)
-        if self.num_cano == "-1":
-            self.phi_AcBc = self.regis_net(cano_A, cano_B)
+        # if self.num_cano == "-1":
+        self.phi_AcBc = self.regis_net(cano_A, cano_B)
         
         # For Mono-modal similarity
         self.phi_AAc_vectorfield = self.phi_BAc(self.phi_AB(self.identity_map))
-        if self.num_cano == "-1":
-            self.phi_AcA_vectorfield = self.phi_BcA(self.phi_AcBc(self.identity_map))
-        else:
-            self.phi_AcA_vectorfield = self.phi_BcA(self.identity_map)
+        # if self.num_cano == "-1":
+        self.phi_AcA_vectorfield = self.phi_BcA(self.phi_AcBc(self.identity_map))
+        # else:
+        #     self.phi_AcA_vectorfield = self.phi_BcA(self.identity_map)
         
-        if self.num_cano == "-1":
-            self.phi_BBc_vectorfield = self.phi_AcBc(self.phi_BAc(self.identity_map))
-        else:
-            self.phi_BBc_vectorfield = self.phi_BAc(self.identity_map)
+        # if self.num_cano == "-1":
+        self.phi_BBc_vectorfield = self.phi_AcBc(self.phi_BAc(self.identity_map))
+        # else:
+        #     self.phi_BBc_vectorfield = self.phi_BAc(self.identity_map)
         self.phi_BcB_vectorfield = self.phi_AB(self.phi_BcA(self.identity_map))
         
         # warp images
@@ -96,13 +98,14 @@ class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
             zero_boundary=True
         )
         with torch.no_grad():
-            self.warped_label_A = compute_warped_image_multiNC(
-                torch.cat([label_A, inbounds_tag], axis=1) if inbounds_tag is not None else label_A,
-                self.phi_AB_vectorfield,
-                self.spacing,
-                0,
-                zero_boundary=True
-            )
+            if self.training_type == 'weakly-supervised':
+                self.warped_label_A = compute_warped_image_multiNC(
+                    torch.cat([label_A, inbounds_tag], axis=1) if inbounds_tag is not None else label_A,
+                    self.phi_AB_vectorfield,
+                    self.spacing,
+                    0,
+                    zero_boundary=True
+                )
             if self.log_mono:
                 self.warped_image_B = compute_warped_image_multiNC(
                     torch.cat([image_B, inbounds_tag], axis=1) if inbounds_tag is not None else image_B,
@@ -150,9 +153,10 @@ class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
                         + self.similarity(self.warped_image_B_to_Bc, cano_B) + self.similarity(self.warped_image_Bc_to_B, image_B)
 
         # DICE score
-        with torch.no_grad():
-            total_dice = dice_score(self.warped_label_A[:,0], label_B[:,0], dice_logging=dice_logging)
-            # log_dice_scores(class_wise_dice, unique_labels)
+        if self.training_type != 'unsupervised':
+            with torch.no_grad():
+                total_dice = dice_score(self.warped_label_A[:,0], label_B[:,0], dice_logging=dice_logging)
+                # log_dice_scores(class_wise_dice, unique_labels)
         
         # inverse consistency loss        
         direction_losses_inv = []
@@ -179,20 +183,20 @@ class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
 
         Iepsilon_can = self.create_Iepsilon()
 
-        if self.num_cano == "-1":
-            approximate_Iepsilon_can = self.phi_BcA(self.phi_AcBc(self.phi_BAc(self.phi_AB(Iepsilon_can))))
-        else:
-            approximate_Iepsilon_can = self.phi_BcA(self.phi_BAc(self.phi_AB(Iepsilon_can)))
+        # if self.num_cano == "-1":
+        approximate_Iepsilon_can = self.phi_BcA(self.phi_AcBc(self.phi_BAc(self.phi_AB(Iepsilon_can))))
+        # else:
+        #     approximate_Iepsilon_can = self.phi_BcA(self.phi_BAc(self.phi_AB(Iepsilon_can)))
         can_cycle_consistency_error = Iepsilon_can - approximate_Iepsilon_can
 
         delta = 0.001
         direction_vectors_can = self.get_direction_vectors(delta=delta)
 
         for d_can in direction_vectors_can:
-            if self.num_cano == "-1":
-                approximate_Iepsilon_d_can = self.phi_BcA(self.phi_AcBc(self.phi_BAc(self.phi_AB(Iepsilon_can + d_can))))
-            else:
-                approximate_Iepsilon_d_can = self.phi_BcA(self.phi_BAc(self.phi_AB(Iepsilon_can + d_can)))
+            # if self.num_cano == "-1":
+            approximate_Iepsilon_d_can = self.phi_BcA(self.phi_AcBc(self.phi_BAc(self.phi_AB(Iepsilon_can + d_can))))
+            # else:
+            #     approximate_Iepsilon_d_can = self.phi_BcA(self.phi_BAc(self.phi_AB(Iepsilon_can + d_can)))
             can_cycle_consistency_error_d = Iepsilon_can + d_can - approximate_Iepsilon_d_can
             grad_can_cycle_consistency_error = (can_cycle_consistency_error - can_cycle_consistency_error_d) / delta
             direction_losses_can.append(torch.mean(grad_can_cycle_consistency_error**2))
@@ -206,34 +210,30 @@ class GradientICONSparse_M2M(network_wrappers.RegistrationModule):
         with torch.no_grad():
             transform_magnitude = torch.mean((self.identity_map - self.phi_AB_vectorfield) ** 2)
         
-        if self.log_mono:
-            return ICONLoss_can_mono(
-                all_loss,
-                similarity_loss,
-                mono_similarity_loss,
-                inverse_consistency_loss,
-                can_cycle_consistency_loss,
-                transform_magnitude,
-                flips(self.phi_BA_vectorfield, in_percentage=True),
-                total_dice
-            )
-        return ICONLoss_can(
-            all_loss,
-            similarity_loss,
-            inverse_consistency_loss,
-            can_cycle_consistency_loss,
-            transform_magnitude,
-            flips(self.phi_BA_vectorfield, in_percentage=True),
-            total_dice
-        )
+        if self.training_type!='unsupervised':
+            if self.log_mono:
+                return ICONLoss_can_mono(all_loss, similarity_loss, mono_similarity_loss, inverse_consistency_loss,
+                                        can_cycle_consistency_loss, transform_magnitude, flips(self.phi_BA_vectorfield, in_percentage=True),
+                                        total_dice)
+            return ICONLoss_can(all_loss, similarity_loss, inverse_consistency_loss, can_cycle_consistency_loss, transform_magnitude,
+                                flips(self.phi_BA_vectorfield, in_percentage=True),
+                                total_dice)
+        else:
+            if self.log_mono:
+                return ICONLoss_can_mono_unsupervised(all_loss, similarity_loss, mono_similarity_loss, inverse_consistency_loss,
+                                        can_cycle_consistency_loss, transform_magnitude, flips(self.phi_BA_vectorfield, in_percentage=True))
+            return ICONLoss_can_unsupervised(all_loss, similarity_loss, inverse_consistency_loss, can_cycle_consistency_loss, transform_magnitude,
+                                flips(self.phi_BA_vectorfield, in_percentage=True))
 
     def clean(self):
         if self.log_mono:
             del self.warped_image_B
-        del self.phi_AB, self.phi_BA, self.phi_AB_vectorfield, self.phi_BA_vectorfield, self.warped_image_A, self.warped_label_A
+        del self.phi_AB, self.phi_BA, self.phi_AB_vectorfield, self.phi_BA_vectorfield, self.warped_image_A
         del self.warped_image_A_to_Ac, self.warped_image_Ac_to_A, self.warped_image_B_to_Bc, self.warped_image_Bc_to_B
-        del self.phi_BcA, self.phi_BAc, self.phi_AAc_vectorfield, self.phi_AcA_vectorfield, self.phi_BBc_vectorfield, self.phi_BcB_vectorfield            
-            
+        del self.phi_BcA, self.phi_BAc, self.phi_AAc_vectorfield, self.phi_AcA_vectorfield, self.phi_BBc_vectorfield, self.phi_BcB_vectorfield
+        if self.training_type!='unsupervised':
+            del self.warped_label_A
+
 class GradientICONSparse(network_wrappers.RegistrationModule):
     def __init__(self, args, network, similarity, use_label=False):
 
@@ -296,32 +296,8 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
             1,
             zero_boundary=True
         )
-        
-        with torch.no_grad():
-            self.warped_label_A = compute_warped_image_multiNC(
-                torch.cat([label_A, inbounds_tag], axis=1) if inbounds_tag is not None else label_A,
-                self.phi_AB_vectorfield,
-                self.spacing,
-                0, # nearset
-                zero_boundary=True
-            )
-                
-            # self.warped_label_B = compute_warped_image_multiNC(
-            #     torch.cat([label_B, inbounds_tag], axis=1) if inbounds_tag is not None else label_B,
-            #     self.phi_BA_vectorfield,
-            #     self.spacing,
-            #     1,
-            # )
-            
-            # similarity_loss = self.similarity(
-            #     self.warped_label_A, label_B
-            # ) + self.similarity(self.warped_label_B, label_A)
 
         similarity_loss = self.similarity(self.warped_image_A, image_B) + self.similarity(self.warped_image_B, image_A)
-
-        with torch.no_grad():
-            total_dice = dice_score(self.warped_label_A[:,0], label_B[:,0], dice_logging=dice_logging)
-            # log_dice_scores(class_wise_dice, unique_labels)
         
         # epsilon for perturbed identity map
         if len(self.input_shape) - 2 == 3:
@@ -378,18 +354,21 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
                 (self.identity_map - self.phi_AB_vectorfield) ** 2
             )
 
-        return ICONLoss(
+        return BASICLoss(
             all_loss,
-            similarity_loss,
-            inverse_consistency_loss,
-            transform_magnitude,
-            flips(self.phi_BA_vectorfield, in_percentage=True),
-            total_dice
+            similarity_loss
         )
+        # return ICONLoss(
+        #     all_loss,
+        #     similarity_loss,
+        #     inverse_consistency_loss,
+        #     transform_magnitude,
+        #     flips(self.phi_BA_vectorfield, in_percentage=True)
+        # )
 
     def clean(self):
         del self.phi_AB, self.phi_BA, self.phi_AB_vectorfield, self.phi_BA_vectorfield, self.warped_image_A, self.warped_image_B
-        del self.warped_label_A
+        # del self.warped_label_A
 
 class TransMorph_wrapper_M2M(network_wrappers.RegistrationModule):
     def __init__(self, args, network, similarity, use_label=False):
@@ -746,7 +725,7 @@ def dice_score(pred_label: torch.Tensor, target_label: torch.Tensor, smooth: flo
     pred_label = pred_label.long()
     target_label = target_label.long()
     num_classes = (max(pred_label.max(), target_label.max()) + 1).item()
-    # print(num_classes)
+
     pred_one_hot = torch.nn.functional.one_hot(pred_label, num_classes)[:, :, :, :, 1:].permute(0, 4, 1, 2, 3).float() # exclude class 0
     target_one_hot = torch.nn.functional.one_hot(target_label, num_classes)[:, :, :, :, 1:].permute(0, 4, 1, 2, 3).float()
     
@@ -789,6 +768,9 @@ def get_3DTransMorph_config(args):
     return config
 
 def make_network(args, include_last_step=False, loss_fn=icon.LNCC(sigma=5), use_label=False):
+    '''
+        Creating network based on input arguments.
+    '''
     dimension = len(args.input_shape) - 2
     if args.model == 'transmorph':
         from other_models.TransMorph import TransMorph
@@ -797,7 +779,6 @@ def make_network(args, include_last_step=False, loss_fn=icon.LNCC(sigma=5), use_
     elif args.model == 'corrmlp':
         from other_models.CorrMLP import CorrMLP
         inner_net = icon.FunctionFromVectorField(CorrMLP(enc_channels=4, dec_channels=8))
-        # inner_net = icon.FunctionFromVectorField(CorrMLP())
     elif args.model == 'gradicon':
         if args.small:
             inner_net = icon.FunctionFromVectorField(networks.tallUNet2_small(dimension=dimension))
@@ -822,15 +803,15 @@ def make_network(args, include_last_step=False, loss_fn=icon.LNCC(sigma=5), use_
 
 
     if args.model == 'gradicon':
-        if args.num_cano == '0':
+        if args.training_type == 'basic':
             net = GradientICONSparse(args, inner_net, loss_fn, use_label=use_label)
         else:
             net = GradientICONSparse_M2M(args, inner_net, loss_fn, use_label=use_label)
     else:
-        if args.num_cano == '0':
-            net = TransMorph_wrapper(args, inner_net, loss_fn, use_label=use_label)
-        else:
-            net = TransMorph_wrapper_M2M(args, inner_net, loss_fn, use_label=use_label)
+        # if args.num_cano == '0':
+        #     net = TransMorph_wrapper(args, inner_net, loss_fn, use_label=use_label)
+        # else:
+        net = TransMorph_wrapper_M2M(args, inner_net, loss_fn, use_label=use_label)
         
     net.assign_identity_map(args.input_shape)
     return net
@@ -929,8 +910,6 @@ def preprocess(image, modality="ct", segmentation=None):
     return image
 
 def main():
-    import itk
-    import argparse
     parser = argparse.ArgumentParser(description="Register two images using unigradicon.")
     parser.add_argument("--fixed", required=True, type=str,
                          help="The path of the fixed image.")
@@ -1061,8 +1040,6 @@ def maybe_cast(img: itk.Image):
     return img, maybe_cast_back
 
 def compute_jacobian_map_command():
-    import itk
-    import argparse
     parser = argparse.ArgumentParser(description="Compute the Jacobian map of a given transform.")
     parser.add_argument("--transform", required=True, type=str,
                             help="The path to the transform file.")

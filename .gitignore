@@ -4,3 +4,5 @@ results/
 *.log
 wandb/
 results_test/
+**.nii.gz
+**.hdf5

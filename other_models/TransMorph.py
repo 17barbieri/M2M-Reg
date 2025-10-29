@@ -274,7 +274,7 @@ class PatchMerging(nn.Module):
         """
         B, L, C = x.shape
         assert L == H * W * T, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0 and T % 2 == 0, f"x size ({H}*{W}) are not even."
+        assert H % 2 == 0 and W % 2 == 0 and T % 2 == 0, f"x size ({H}*{W}*{T}) are not even."
 
         x = x.view(B, H, W, T, C)
 
